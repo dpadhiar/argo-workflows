@@ -30,6 +30,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 	apiwatch "k8s.io/client-go/tools/watch"
 	"k8s.io/client-go/util/workqueue"
+	"k8s.io/utils/strings/slices"
 	"upper.io/db.v3/lib/sqlbuilder"
 
 	"github.com/argoproj/argo-workflows/v3"
@@ -45,7 +46,10 @@ import (
 	"github.com/argoproj/argo-workflows/v3/util/diff"
 	"github.com/argoproj/argo-workflows/v3/util/env"
 	errorsutil "github.com/argoproj/argo-workflows/v3/util/errors"
+	"github.com/argoproj/argo-workflows/v3/util/slice"
 	"github.com/argoproj/argo-workflows/v3/workflow/artifactrepositories"
+	executor "github.com/argoproj/argo-workflows/v3/workflow/artifacts"
+	"github.com/argoproj/argo-workflows/v3/workflow/artifacts/resource"
 	"github.com/argoproj/argo-workflows/v3/workflow/common"
 	controllercache "github.com/argoproj/argo-workflows/v3/workflow/controller/cache"
 	"github.com/argoproj/argo-workflows/v3/workflow/controller/entrypoint"
@@ -873,6 +877,92 @@ func (wfc *WorkflowController) addWorkflowInformerHandlers(ctx context.Context) 
 			}
 		},
 	})
+	wfc.wfInformer.AddEventHandler(cache.FilteringResourceEventHandler{
+		FilterFunc: func(obj interface{}) bool {
+			un := obj.(*unstructured.Unstructured)
+			return slices.Contains(un.GetFinalizers(), common.FinalizerArtifactGC)
+		},
+		Handler: cache.ResourceEventHandlerFuncs{
+			AddFunc: func(obj interface{}) {
+				wfc.garbageCollectArtifacts(ctx, obj)
+			},
+			UpdateFunc: func(_, obj interface{}) {
+				wfc.garbageCollectArtifacts(ctx, obj)
+			},
+			DeleteFunc: func(obj interface{}) {
+				wfc.garbageCollectArtifacts(ctx, obj)
+			},
+		},
+	})
+}
+
+func (wfc *WorkflowController) garbageCollectArtifacts(ctx context.Context, obj interface{}) {
+	un := obj.(*unstructured.Unstructured)
+	artifactSearchQuery := wfv1.NewArtifactSearchQuery()
+
+	// log.WithField("labels", un.GetLabels())
+
+	if un.GetLabels()["workflows.argoproj.io/phase"] == "Succeeded" {
+		artifactSearchQuery.ArtifactGCStrategies[wfv1.ArtifactGCOnWorkflowCompletion] = true
+	}
+
+	if un.GetDeletionTimestamp() != nil {
+		artifactSearchQuery.ArtifactGCStrategies[wfv1.ArtifactGCOnWorkflowDeletion] = true
+	}
+
+	if err := wfc.deleteArtifacts(ctx, un, artifactSearchQuery); err != nil {
+		log.WithError(err).Error("failed to delete artifacts")
+		return
+	}
+
+	if un.GetDeletionTimestamp() == nil {
+		return
+	}
+
+	data, _ := json.Marshal(map[string]interface{}{
+		"metadata": map[string]interface{}{
+			"finalizers": slice.RemoveString(un.GetFinalizers(), common.FinalizerArtifactGC),
+		},
+	})
+
+	_, err := wfc.wfclientset.ArgoprojV1alpha1().Workflows(un.GetNamespace()).Patch(ctx, un.GetName(), types.MergePatchType, data, metav1.PatchOptions{})
+	if err != nil && !apierr.IsNotFound(err) {
+		log.WithError(err).Error("failed to remove artifact GC finalizer")
+	}
+}
+
+func (wfc *WorkflowController) deleteArtifacts(ctx context.Context, un *unstructured.Unstructured, asq *wfv1.ArtifactSearchQuery) error {
+	// expensive operation, should be replaced
+	wf, _ := util.FromUnstructured(un)
+
+	log.WithField("strategies", asq.ArtifactGCStrategies).WithField("namespace", un.GetNamespace()).WithField("name", un.GetName()).Info("artifact garbage collection")
+	artifactsToDelete := wf.SearchArtifacts(asq)
+	for _, a := range artifactsToDelete {
+		if err := wfc.deleteArtifact(ctx, wf, a); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (wfc *WorkflowController) deleteArtifact(ctx context.Context, wf *wfv1.Workflow, a wfv1.Artifact) error {
+	ar, err := wfc.artifactRepositories.Get(ctx, wf.Status.ArtifactRepositoryRef)
+	if err != nil {
+		return err
+	}
+	l := ar.ToArtifactLocation()
+	if err := a.Relocate(l); err != nil {
+		return err
+	}
+	key, _ := a.GetKey()
+	log.WithField("name", a.Name).WithField("key", key).Info("deleting artifact")
+	drv, err := executor.NewDriver(ctx, &a, resource.New(wfc.kubeclientset, wf.Namespace))
+	if err != nil {
+		return err
+	}
+
+	return drv.Delete(&a)
 }
 
 func (wfc *WorkflowController) archiveWorkflow(ctx context.Context, obj interface{}) {

@@ -1267,7 +1267,7 @@ func (w *Workflow) SearchArtifacts(q *ArtifactSearchQuery) Artifacts {
 	for _, n := range w.Status.Nodes {
 		t := w.GetTemplateByName(n.TemplateName)
 		for _, a := range n.GetOutputs().GetArtifacts() {
-			artifactByName := t.GetOutputs().GetArtifactByName(a.Name)
+			// artifactByName := t.GetOutputs().GetArtifactByName(a.Name)
 			templateStrategy := t.GetArtifactGC().GetStrategy()
 			wfStrategy := w.Spec.GetArtifactGC().GetStrategy()
 			strategy := wfStrategy
@@ -1275,7 +1275,7 @@ func (w *Workflow) SearchArtifacts(q *ArtifactSearchQuery) Artifacts {
 				strategy = templateStrategy
 			}
 			if q.ArtifactGCStrategies[strategy] == true {
-				artifacts = append(artifacts, *artifactByName)
+				artifacts = append(artifacts, a)
 			}
 		}
 	}
@@ -1303,6 +1303,9 @@ type Outputs struct {
 }
 
 func (o *Outputs) GetArtifacts() Artifacts {
+	if o == nil {
+		return nil
+	}
 	return o.Artifacts
 }
 
